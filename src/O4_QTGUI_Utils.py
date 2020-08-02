@@ -122,7 +122,7 @@ class MainWindow(QMainWindow):
         self.settings = settings
 
         self.scrollBarsRestored = False
-        self.setWindowTitle("My Pretty Good App")
+        self.setWindowTitle("Ortho4XP (New Look)")
 
         toolbar = PersistentToolBar("Main toolbar")
         toolbar.setObjectName("MainToolbar")
@@ -138,7 +138,7 @@ class MainWindow(QMainWindow):
         tileDocker.setObjectName("TileViewDock")
 
         self.batchToolbox = BuildToolbox()
-        batchDocker = self.dock('Batch build', Qt.LeftDockWidgetArea, self.batchToolbox)
+        batchDocker = self.dock('Batch Build', Qt.LeftDockWidgetArea, self.batchToolbox)
         batchDocker.setObjectName('BatchBuild')
 
         self.configWindow = ConfigWindow()
@@ -215,7 +215,7 @@ class MainWindow(QMainWindow):
         workDirToolbar.setIconSize(QSize(16, 16))
         self.addToolBar(workDirToolbar)
 
-        workDirToolbar.addWidget(QLabel("Working folder:"))
+        workDirToolbar.addWidget(QLabel("Custom build folder:"))
         self.workDir = QLineEdit(self)
         self.workDir.setMaximumWidth(500)
         workDirToolbar.addWidget(self.workDir)
@@ -245,10 +245,10 @@ class MainWindow(QMainWindow):
         safeRestore(self.settings, 'mainWindow/state', self.restoreState)
 
     def chooseWorkFolder(self):
-        dialog = QFileDialog(caption = 'Choose Working Folder')
+        dialog = QFileDialog(caption = 'Choose Custom Build Folder')
         dialog.setFileMode(QFileDialog.Directory)
         if (dialog.exec()):
-            self.workDir.setText(dialog.selectedFiles()[0])
+            self.workDir.setText(dialog.selectedFiles()[0] + '/')
 
     def dock(self, title, area, widget):
         dockWidget = QDockWidget(title)
@@ -599,6 +599,8 @@ class Model(QObject):
         self.workingDir = ''
         self.tilesFinished.connect(self.tileReadDone)
         self.buildFinished.connect(self.tileBuildDone)
+        self.grouped = False
+        self.custom_build_dir = ''
 
     def start(self):
         print('Model: start')
@@ -626,6 +628,7 @@ class Model(QObject):
         self.tileReader = Worker(target = self.tileReadWorker, name = 'Tile Reader')
         self.tileReader.workDir = self.workingDir
         self.tileReader.targetDir = CFG.custom_scenery_dir
+        self.tileReader.grouped = self.grouped
         self.tileReader.start()
 
     @pyqtSlot()
@@ -643,21 +646,28 @@ class Model(QObject):
 
     @pyqtSlot(str)
     def setWorkingDir(self, dir):
-        if dir != self.workingDir:
-            print('Model: working dir set to', dir)
-            self.workingDir = dir
+#        newDir = FNAMES.Tile_dir if not dir else dir
+        if dir != self.custom_build_dir:
+            self.custom_build_dir = dir
+            self.grouped = dir and dir[-1] != '/'
+            self.workingDir = dir if dir else FNAMES.Tile_dir
             self.workingDirChanged.emit(dir)
             self.refreshTiles()
 
     @pyqtSlot(object)
     def toggleLink(self, id):
-        toggleLink(self.workingDir, CFG.custom_scenery_dir, id)
-        self.linkStateChanged.emit(id, linkExists(self.workingDir, CFG.custom_scenery_dir, id))
+        subdir = None if self.grouped else makeDirName(id)
+        toggleLink(self.workingDir, CFG.custom_scenery_dir, subdir)
+        if not self.grouped:
+            self.linkStateChanged.emit(id, linkExists(self.workingDir,
+                CFG.custom_scenery_dir, subdir))
+        else:
+            self.refreshTiles()
 
     @pyqtSlot()
     def finalize(self):
         UI.red_flag = True
-        self.settings.setValue('config/workDir', self.workingDir)
+        self.settings.setValue('config/workDir', self.custom_build_dir)
         self.settings.setValue('config/defaultWebsite', CFG.default_website)
 #        self.settings.setValue('config/defaultZl', CFG.default_zl)
         if self.tileReader:
@@ -691,7 +701,7 @@ class Model(QObject):
         self.tilesQueued.emit(task.tiles)
         tiles = sorted(task.tiles)
         lat, lon = tiles[0]
-        tileCfg = CFG.Tile(lat, lon, self.workingDir)
+        tileCfg = CFG.Tile(lat, lon, self.custom_build_dir)
         args = [tileCfg, tiles] + todo
 
         self.tileBuilder = Worker(target = self.tileBuildWorker, args = args)
@@ -713,14 +723,28 @@ class Model(QObject):
         except:
             self.tilesFinished.emit()
             return
-        for dir in subdirs:
-            if self.tileReader.is_canceled(): break
-            if not dir.startswith('zOrtho4XP_'): continue
-            lat = int(dir[10:13])
-            lon = int(dir[13:17])
-            id = (lat, lon)
-            info = readTile(self.tileReader.workDir, self.tileReader.targetDir, id, dir)
-            self.newTileState.emit(id, info)
+
+        if not self.tileReader.grouped:
+            for dir in subdirs:
+                if self.tileReader.is_canceled(): break
+                if not dir.startswith('zOrtho4XP_'): continue
+                lat = int(dir[10:13])
+                lon = int(dir[13:17])
+                id = (lat, lon)
+                info = readTile(self.tileReader.workDir, self.tileReader.targetDir, \
+                    os.path.join(dir, 'Ortho4XP_' + dir[10:17] + '.cfg'), dir)
+                self.newTileState.emit(id, info)
+        else:
+            for file in subdirs:
+                print(file[:10], file[-4:])
+                if self.tileReader.is_canceled(): break
+                if not (file[:9] == 'Ortho4XP_' and file[-4:] == '.cfg'): continue
+                lat = int(file[9:12])
+                lon = int(file[12:16])
+                id = (lat, lon)
+                info = readTile(self.tileReader.workDir, self.tileReader.targetDir, file)
+                self.newTileState.emit(id, info)
+
         self.tilesFinished.emit()
 
     def tileBuildWorker(self, *args):
@@ -733,17 +757,20 @@ class Model(QObject):
         self.progressChanged.emit(nbr, value)
 
     def notifyTileCompletedAsync(self, id):
-        info = readTile(self.workingDir, CFG.custom_scenery_dir, id)
+        info = readTile(self.workingDir, CFG.custom_scenery_dir, cfgFile(self.grouped, id), \
+            None if self.grouped else makeDirName(id))
         self.newTileState.emit(id, info)
 
-def readTile(workDir, targetDir, id, dir = None):
+def cfgFile(grouped, id):
+    dirname = makeDirName(id, '')
+    cfg = dirname + '.cfg'
+    return cfg if grouped else os.path.join('z' + dirname, cfg)
+
+def readTile(workDir, targetDir, cfg_in_workDir, link_subdir = None):
+    path = os.path.join(workDir, cfg_in_workDir)
     provider = None
     zl = None
     isLinked = False
-    lat, lon = id
-    if not dir:
-        dir = makeDirName(id)
-    path = os.path.join(workDir, dir, 'Ortho4XP_' + dir[10:17] + '.cfg')
     info = None
     try:
         with open(path) as f:
@@ -754,7 +781,7 @@ def readTile(workDir, targetDir, id, dir = None):
                     zl = line.split('=')[1].strip()
                 if provider and zl: break
         info = TileInfo(provider, zl)
-        info.isLinked = linkExists(workDir, targetDir, id)
+        info.isLinked = linkExists(workDir, targetDir, link_subdir)
     except:
         pass
     return info
@@ -771,23 +798,25 @@ def pixelYToLat(y):
 def pixelXToLon(x):
     return (x / 2**13 - 1.0) * 180
 
-def makeDirName(id):
+def makeDirName(id, prefix = 'z'):
     lat, lon = id
-    return 'zOrtho4XP_{:+03d}{:+04d}'.format(lat, lon)
+    return prefix + 'Ortho4XP_{:+03d}{:+04d}'.format(lat, lon)
 
-def linkExists(workDir, targetDir, id):
-    dir = makeDirName(id)
-    link = os.path.join(targetDir, dir)
-    working = os.path.join(workDir, dir)
+def linkDirs(workDir, targetDir, subdir = None):
+    working = os.path.join(workDir, subdir) if subdir else workDir
+    link = os.path.join(targetDir, subdir if subdir else os.path.basename(workDir))
+    return (working, link)
+
+def linkExists(workDir, targetDir, subdir = None):
+    (working, link) = linkDirs(workDir, targetDir, subdir)
     return os.path.isdir(link) and os.path.samefile(working, os.path.realpath(link))
 
-def toggleLink(workDir, targetDir, id):
-    dir = makeDirName(id)
-    link = os.path.join(targetDir, dir)
-    if linkExists(workDir, targetDir, id):
+def toggleLink(workDir, targetDir, subdir = None):
+    (working, link) = linkDirs(workDir, targetDir, subdir)
+    if linkExists(workDir, targetDir, subdir):
         os.remove(link)
     elif not os.path.exists(link):
-        os.symlink(os.path.join(workDir, dir), link)
+        os.symlink(working, link)
 
 def safeRestore(settings, name, action):
     val = settings.value(name)
