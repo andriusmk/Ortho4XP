@@ -2,6 +2,7 @@ import sys
 import os
 import platform
 import time
+import shutil
 from copy import copy
 from math import log, tan, pi, atan, exp, floor
 from threading import Event, Thread
@@ -43,7 +44,7 @@ class Ortho4XP_GUI:
         self.buildDelegate = BuildDelegate()
 
         self.model.removeAllTiles.connect(self.window.tileCanvas.removeAllTiles)
-        self.model.newTileState.connect(self.window.tileCanvas.setTileState)
+        self.model.newTileState.connect(self.window.tileCanvas.setTileState, Qt.QueuedConnection)
         self.window.bug.triggered.connect(self.model.refreshTiles)
         self.window.workDir.textChanged.connect(self.model.setWorkingDir)
         self.model.workingDirChanged.connect(self.window.workDir.setText)
@@ -51,7 +52,7 @@ class Ortho4XP_GUI:
         self.window.tileCanvas.linkRequested.connect(self.model.toggleLink)
         self.window.tileCanvas.tileSelected.connect(self.buildDelegate.addRemoveTile)
         self.model.linkStateChanged.connect(self.window.tileCanvas.setTileIsLinked)
-        self.model.progressChanged.connect(self.window.setProgress)
+        self.model.progressChanged.connect(self.window.setProgress, Qt.QueuedConnection)
         self.window.configWindow.customDemCb.currentTextChanged.connect(self.model.setCustomDem)
         self.window.defaultWebsite.currentTextChanged.connect(self.model.setDefaultWebsite)
         self.model.defaultWebsiteChanged.connect(self.window.defaultWebsite.setCurrentText)
@@ -66,6 +67,7 @@ class Ortho4XP_GUI:
         self.buildDelegate.buildRequest.connect(self.model.buildTiles)
         self.buildDelegate.deleteRequest.connect(self.model.deleteData)
         self.model.tilesQueued.connect(self.window.tileCanvas.queueTiles)
+        self.window.tileCanvas.focusedTileChanged.connect(self.model.setActiveTile)
 
     def mainloop(self):
         self.window.show()
@@ -84,7 +86,7 @@ class Console(QPlainTextEdit):
         super(Console, self).__init__(parent)
         self.setReadOnly(True)
         self.setFont(QFont("Courier New"))
-        self.writeSignal.connect(self.doWrite)
+        self.writeSignal.connect(self.doWrite, Qt.QueuedConnection)
 
 # Write can be called from any thread so do it through a signal
     def write(self, line):
@@ -154,7 +156,14 @@ class MainWindow(QMainWindow):
             pb.setValue(0)
             statusbar.addWidget(pb)
 
+        self.latitudeLabel = QLabel('Lat: 0')
+        self.longitudeLabel = QLabel('Lon: 0')
+        for w in [self.latitudeLabel, self.longitudeLabel]:
+            statusbar.addWidget(w)
+
         self.setStatusBar(statusbar)
+
+        self.tileCanvas.focusedTileChanged.connect(self.displayCoordinates)
 
         console = Console(self)
         consoleDocker = self.dock('Console', Qt.BottomDockWidgetArea, console)
@@ -286,6 +295,12 @@ class MainWindow(QMainWindow):
     def setProgress(self, nbr, value):
         self.progress[nbr].setValue(value)
 
+    @pyqtSlot(object)
+    def displayCoordinates(self, id):
+        lat, lon = id
+        self.latitudeLabel.setText('Lat: ' + str(lat))
+        self.longitudeLabel.setText('Lon: ' + str(lon))
+
 class BuildToolbox(QWidget):
 
     def __init__(self, parent = None):
@@ -356,11 +371,13 @@ class TileInfo(object):
 class TileCanvas(QGraphicsScene):
     linkRequested = pyqtSignal(object)
     tileSelected = pyqtSignal(object, bool)
+    focusedTileChanged = pyqtSignal(object)
     def __init__(self, parent = None):
         super(TileCanvas, self).__init__(0, 0, 16384, 16384, parent)
         self.tileIndex = {}
         self.selectedTiles = set()
         self.queuedTiles = set()
+        self.focusedTileItem = None
         for x in range(8):
             for y in range(8):
                 fname = os.path.join('Utils', 'Earth', 'Earth2_ZL6_{x}_{y}.jpg'.format(x=x, y=y))
@@ -405,16 +422,19 @@ class TileCanvas(QGraphicsScene):
                 self.removeItem(item)
         self.tileIndex = {}
 
+    def setFocusedItem(self, item):
+        if self.focusedTileItem:
+            self.focusedTileItem.focused = False
+        self.focusedTileItem = item
+        item.focused = True
+        self.focusedTileChanged.emit(item.id)
+
     def findTile(self, pos):
         tiles = [item for item in self.items(pos) if isinstance(item, TileItem)]
         return tiles[0] if tiles else None
 
-    def mousePressEvent(self, evt):
-        if evt.modifiers() == Qt.MetaModifier if platform.system() == 'Darwin' else Qt.ControlModifier:
-            tile = self.findTile(evt.scenePos())
-            if tile:
-                self.linkRequested.emit(tile.id)
-        elif evt.modifiers() == Qt.NoModifier and evt.buttons() == Qt.LeftButton:
+    def processLeftClick(self, evt):
+        if evt.modifiers() == Qt.NoModifier and evt.buttons() == Qt.LeftButton:
             pos = evt.scenePos()
             tile = self.findTile(pos)
             if tile:
@@ -426,7 +446,21 @@ class TileCanvas(QGraphicsScene):
                     tile = self.setTileState((lat, lon), None)
                     tile.isSelected = True
             if tile:
+                self.setFocusedItem(tile)
                 self.tileSelected.emit(tile.id, tile.isSelected)
+
+
+    def mousePressEvent(self, evt):
+        if evt.modifiers() == (Qt.MetaModifier if platform.system() == 'Darwin' else Qt.ControlModifier):
+            tile = self.findTile(evt.scenePos())
+            if tile:
+                self.linkRequested.emit(tile.id)
+        else:
+            self.processLeftClick(evt)
+
+    def mouseDoubleClickEvent(self, evt):
+        self.processLeftClick(evt)
+
 
 class TileItem(QGraphicsRectItem):
     normalFont = QFont("Courier New", pointSize = 10)
@@ -437,6 +471,8 @@ class TileItem(QGraphicsRectItem):
     infoPen = QPen(infoPenBrush, 1)
     selectBrush = QBrush(QColor(0xFF, 0x00, 0x00, 0x20))
     queuedBrush = QBrush(QColor(0xFF, 0x00, 0xFF, 0x20))
+    focusBrush = QBrush(QColor(0xFF, 0xFF, 0x00, 0xC0))
+    focusPen = QPen(focusBrush, 3)
 
     def __init__(self, id):
         super(TileItem, self).__init__()
@@ -446,6 +482,8 @@ class TileItem(QGraphicsRectItem):
         self._queued = False
         self._provider = None # QGraphicsTextItem('', self)
         self._zl = None # QGraphicsTextItem('', self)
+        self._focusMarker = None
+        self._focused = False
 
         (lat, lon) = id
         [y0, y1] = map(latToPixelY, [lat, lat + 1])
@@ -530,6 +568,24 @@ class TileItem(QGraphicsRectItem):
             self._info.isLinked = ln
         self.updateView()
 
+    @property
+    def focused(self):
+        return self._focused
+
+    @focused.setter
+    def focused(self, f):
+        self._focused = f
+        if f:
+            if not self._focusMarker:
+                self._focusMarker = QGraphicsRectItem(self)
+                self._focusMarker.setRect(2, 2 - self.h, self.w - 4, self.h - 4)
+                self._focusMarker.setPen(self.focusPen)
+            else:
+                self._focusMarker.setVisible(True)
+        else:
+            if self._focusMarker:
+                self._focusMarker.setVisible(False)
+
 class Worker(Thread):
     def __init__(self, *args, **kwargs):
         super(Worker, self).__init__(*args, **kwargs)
@@ -597,29 +653,26 @@ class Model(QObject):
         self.tileBuilder = None
         self.tileRefreshPending = False
         self.workingDir = ''
-        self.tilesFinished.connect(self.tileReadDone)
-        self.buildFinished.connect(self.tileBuildDone)
+        self.tilesFinished.connect(self.tileReadDone, Qt.QueuedConnection)
+        self.buildFinished.connect(self.tileBuildDone, Qt.QueuedConnection)
         self.grouped = False
         self.custom_build_dir = ''
+        self.activeTile = None
 
     def start(self):
-        print('Model: start')
-        print('Custom scenery dir', CFG.custom_scenery_dir)
-        print('Custom DEM', CFG.custom_dem)
-        print('Default website', CFG.default_website)
-        print('Zone list', CFG.zone_list)
-        print('DEM sources:', DEM.available_sources[1::2])
         map_list = sorted([provider_code for provider_code in set(IMG.providers_dict) if IMG.providers_dict[provider_code]['in_GUI']]+sorted(set(IMG.combined_providers_dict)))
         map_list = [provider_code for provider_code in map_list if provider_code!='SEA']
-        print('Providers:', map_list)
         safeRestore(self.settings, 'config/workDir', self.setWorkingDir)
         safeRestore(self.settings, 'config/defaultWebsite', self.setDefaultWebsite)
 #        safeRestore(self.settings, 'config/defaultZl', lambda zl: self.setDefaultZl(str(zl)))
         self.defaultZlChanged.emit(str(CFG.default_zl))
 
+    @pyqtSlot(object)
+    def setActiveTile(self, id):
+        self.activeTile = id
+
     @pyqtSlot()
     def refreshTiles(self):
-        print("Model: refreshing tiles")
         if (self.tileReader):
             self.tileReader.cancel()
             self.tileRefreshPending = True
@@ -633,7 +686,7 @@ class Model(QObject):
 
     @pyqtSlot()
     def tileReadDone(self):
-        print('Model: tiles finished')
+        print('Tile view updated')
         self.tileReader = None
         if self.tileRefreshPending:
             self.tileRefreshPending = False
@@ -641,7 +694,6 @@ class Model(QObject):
 
     @pyqtSlot()
     def tileBuildDone(self):
-        print('Model: build finished')
         self.tileBuilder = None
 
     @pyqtSlot(str)
@@ -685,11 +737,9 @@ class Model(QObject):
 
     @pyqtSlot(str)
     def setDefaultZl(self, zls):
-        print('setDefaultZl', zls, type(zls))
         zl = int(zls)
         if zl != CFG.default_zl:
             CFG.default_zl = zl
-            print('defaultZl changed', zls, type(zls))
             self.defaultZlChanged.emit(str(zls))
 
     @pyqtSlot(object)
@@ -714,8 +764,31 @@ class Model(QObject):
 
     @pyqtSlot(object)
     def deleteData(self, task):
-        todo = map(lambda name: task.toDo[name], list_del_ckbtn)
-        print('Delete data', list(todo), sorted(task.tiles))
+        print('Delete requested', task.toDo)
+        if not self.activeTile: return
+        lat, lon = self.activeTile
+        if task.toDo['OSM data']:
+            try: shutil.rmtree(FNAMES.osm_dir(lat, lon))
+            except Exception as e:
+                UI.vprint(3,e)
+        if task.toDo['Mask data']:
+            try: shutil.rmtree(FNAMES.mask_dir(lat, lon))
+            except Exception as e:
+                UI.vprint(3,e)
+        if task.toDo['Jpeg imagery']:
+            try: shutil.rmtree(os.path.join(FNAMES.Imagery_dir,FNAMES.long_latlon(lat, lon)))
+            except Exception as e:
+                UI.vprint(3,e)
+        if task.toDo['Tile (whole)'] and not self.grouped:
+            try: shutil.rmtree(FNAMES.build_dir(lat, lon, self.custom_build_dir))
+            except Exception as e:
+                UI.vprint(3,e)
+            self.newTileState.emit(self.activeTile, None)
+        if task.toDo['Tile (textures)'] and not self.grouped:
+            print('Deleting textures', lat, lon, os.path.join(FNAMES.build_dir(lat, lon, self.custom_build_dir), 'textures'))
+            try: shutil.rmtree(os.path.join(FNAMES.build_dir(lat, lon, self.custom_build_dir), 'textures'))
+            except Exception as e:
+                UI.vprint(3,e)
 
     def tileReadWorker(self):
         try:
@@ -736,7 +809,6 @@ class Model(QObject):
                 self.newTileState.emit(id, info)
         else:
             for file in subdirs:
-                print(file[:10], file[-4:])
                 if self.tileReader.is_canceled(): break
                 if not (file[:9] == 'Ortho4XP_' and file[-4:] == '.cfg'): continue
                 lat = int(file[9:12])

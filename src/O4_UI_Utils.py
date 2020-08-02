@@ -3,7 +3,7 @@ import sys
 import time
 
 Ortho4XP_dir='..' if getattr(sys,'frozen',False) else '.'
-verbosity=1
+verbosity=10
 red_flag=False
 is_working=False
 cleaning_level=1
