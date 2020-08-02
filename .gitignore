@@ -13,3 +13,6 @@ Tiles/
 **/Thumbs.db
 **/*.bak
 .last_gui_params.txt
+.DS_Store
+Extents/Auto/
+icons-all/
