@@ -3,6 +3,8 @@ import os
 import platform
 import time
 import shutil
+import subprocess
+import signal
 from copy import copy
 from math import log, tan, pi, atan, exp, floor
 from threading import Event, Thread
@@ -820,9 +822,21 @@ class Model(QObject):
         self.tilesFinished.emit()
 
     def tileBuildWorker(self, *args):
+        if platform.system() == 'Darwin':
+            coffee = subprocess.Popen('caffeinate')
+            print('System caffeinated')
         try:
             TILE.build_tile_list(*args)
+#            time.sleep(5)
         except: pass
+        if platform.system() == 'Darwin':
+            try:
+                coffee.send_signal(signal.SIGINT)
+            except subprocess.TimeoutExpired:
+                coffee.kill()
+                print('caffeinate killed')
+            coffee.wait()
+            print('System decaffeinated')
         self.buildFinished.emit()
 
     def setProgressAsync(self, nbr, value):
